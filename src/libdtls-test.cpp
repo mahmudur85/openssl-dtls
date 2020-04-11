@@ -48,6 +48,16 @@ struct pass_info {
     SSL *ssl;
 };
 
+enum ContextType {
+    DEVICE = 1, TUNNEL = 2, CLIENT = 3
+};
+
+typedef struct Context_t {
+    ContextType type;
+    int fd;
+    // void *ptr;
+} Context;
+
 int verify_depth = 0;
 int verify_quiet = 0;
 int verify_error = X509_V_OK;
@@ -449,12 +459,6 @@ int main(int argc, char *argv[]) {
     const SSL_METHOD *mtd = DTLS_server_method();
     ctx = SSL_CTX_new(mtd);
     SSL_CTX_set_min_proto_version(ctx, DTLS1_2_VERSION);
-    /*SSL_CTX_use_certificate_chain_file(ctx, "../certs/ca-cert.pem");
-    SSL_CTX_use_PrivateKey_file(ctx, "../certs/keycert.pem", SSL_FILETYPE_PEM);
-    if (!SSL_CTX_check_private_key (ctx))
-        derror("invalid private key!");
-    ret = SSL_CTX_set_default_verify_file(ctx);
-    fprintf(stderr, "SSL_CTX_set_default_verify_file -> %d\n", ret);*/
 
     pid = getpid();
     if (!SSL_CTX_set_session_id_context(ctx, (const unsigned char *) &pid, sizeof pid)) {
@@ -495,12 +499,23 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
+#ifndef WITH_EPOLL_DATA_PTR
     // Add the Tunnel to epoll
     event.data.fd = server_fd;
+#else
+    // Add the Tunnel to epoll
+    auto *serverCtx = new Context;
+    // serverCtx->ptr = tunnel_var;
+    serverCtx->fd = server_fd;
+    serverCtx->type = TUNNEL;
+    event.data.ptr = serverCtx;
+#endif
     event.events = EPOLLIN | EPOLLET;
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &event) < 0) {
         exit(1);
     }
+
+
     while (running){
 
 
@@ -526,31 +541,49 @@ int main(int argc, char *argv[]) {
         // time_now = time(NULL);
 
         for(int i=0; i < ev_num; i++){
+#ifdef WITH_EPOLL_DATA_PTR
+            auto context = (Context *) (events[i].data.ptr);
+#endif
+
             if ((events[i].events & EPOLLERR) ||
                 (events[i].events & EPOLLHUP) ||
                 (!(events[i].events & EPOLLIN))){
                 /* An error has occured on this fd, or the socket is not
                    ready for reading (why were we notified then?) */
                 perror("epoll error");
-                close(events[i].data.fd < 0);
+#ifndef WITH_EPOLL_DATA_PTR
+                close(events[i].data.fd);
+#else
+                close(context->fd);
+#endif
                 continue;
             }
-
+#ifndef WITH_EPOLL_DATA_PTR
             if(events[i].data.fd < 0){
                 derror("invalid epoll event. fd:%d\n", events[i].data.fd);
                 continue;
             }
+#else
+            if(context->fd < 0){
+                derror("invalid epoll event. fd:%d\n", context->fd);
+                continue;
+            }
+#endif
 
             if((events[i].events & EPOLLIN)){
                 /*char buffer[BUFSIZE];
                 int rlen;
                 socklen_t sock_len;*/
 
-                //recvfrom(events[i].data.fd, buffer, BUFSIZE, 0, &addr, &sock_len);
                 memset(&client_addr, 0, sizeof(struct sockaddr_storage));
 
+#ifndef WITH_EPOLL_DATA_PTR
                 /* Create BIO */
                 bio = BIO_new_dgram(events[i].data.fd, BIO_NOCLOSE);
+#else
+                /* Create BIO */
+                bio = BIO_new_dgram(context->fd, BIO_NOCLOSE);
+#endif
 
                 /* Set and activate timeouts */
                 timeout.tv_sec = 5;
