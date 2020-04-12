@@ -1,3 +1,9 @@
+/**
+ * https://github.com/openssl/openssl/issues/6934
+ * https://gist.github.com/Jxck/b211a12423622fe304d2370b1f1d30d5
+ */
+
+
 #include <string>
 #include <iostream>
 #include <cstdio>
@@ -38,6 +44,8 @@ using namespace std;
 #define BUFSIZE 2048
 #define COOKIE_SECRET_LENGTH 16
 
+static pthread_mutex_t* mutex_buf = NULL;
+
 struct pass_info {
     union {
         struct sockaddr_storage ss;
@@ -67,6 +75,45 @@ BIO *dtls_bio_err = NULL;
 int cookie_initialized;
 unsigned char cookie_secret[COOKIE_SECRET_LENGTH];
 BIO *dtls_bio_log = NULL;
+
+static void locking_function(int mode, int n, const char *file, int line) {
+    if (mode & CRYPTO_LOCK)
+        pthread_mutex_lock(&mutex_buf[n]);
+    else
+        pthread_mutex_unlock(&mutex_buf[n]);
+}
+
+static unsigned long id_function(void) {
+    return (unsigned long) pthread_self();
+}
+
+int THREAD_setup() {
+    int i;
+
+    mutex_buf = (pthread_mutex_t*) malloc(CRYPTO_num_locks() * sizeof(pthread_mutex_t));
+    if (!mutex_buf)
+        return 0;
+    for (i = 0; i < CRYPTO_num_locks(); i++)
+            pthread_mutex_init(&mutex_buf[i], NULL);
+    CRYPTO_set_id_callback(id_function);
+    CRYPTO_set_locking_callback(locking_function);
+    return 1;
+}
+
+int THREAD_cleanup() {
+    int i;
+
+    if (!mutex_buf)
+        return 0;
+
+    CRYPTO_set_id_callback(NULL);
+    CRYPTO_set_locking_callback(NULL);
+    for (i = 0; i < CRYPTO_num_locks(); i++)
+            pthread_mutex_destroy(&mutex_buf[i]);
+    free(mutex_buf);
+    mutex_buf = NULL;
+    return 1;
+}
 
 static void dtls_report_err(char *fmt, ...) {
     va_list args;
@@ -402,7 +449,7 @@ void* connection_handle(void *info) {
     while (ret == 0);
     if (ret < 0) {
         perror("SSL_accept");
-        printf("%s\n", ERR_error_string(ERR_get_error(), buf));
+        printf("SSL_accept: %s\n", ERR_error_string(ERR_get_error(), buf));
         goto cleanup;
     }
 
@@ -411,7 +458,9 @@ void* connection_handle(void *info) {
     timeout.tv_usec = 0;
     BIO_ctrl(SSL_get_rbio(ssl), BIO_CTRL_DGRAM_SET_RECV_TIMEOUT, 0, &timeout);
 
-    cleanup:
+    SSL_shutdown(ssl);
+
+cleanup:
     close(fd);
     free(info);
     SSL_free(ssl);
@@ -446,6 +495,7 @@ int main(int argc, char *argv[]) {
     SSL_CTX *ctx;
     struct timeval timeout;
 
+    THREAD_setup();
     OpenSSL_add_all_algorithms();
     ERR_load_BIO_strings();
     ERR_load_crypto_strings();
@@ -515,17 +565,13 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-
     while (running){
-
-
         dprint("waiting for en event....\n");
         // Wait for something to happen on one of the file descriptors
         // we are waiting on
         do {
-            ev_num = epoll_wait(epoll_fd, events, MAX_TUNNEL_EVENTS, -1);
+            ev_num = epoll_wait(epoll_fd, events, MAX_TUNNEL_EVENTS, EPOLL_TIMEOUT);
         } while (ev_num == -1 && errno == EINTR);
-
         if (ev_num < 0) {
             if (errno == EINTR) {
                 perror("epoll_wait interrupted");
@@ -610,6 +656,8 @@ int main(int argc, char *argv[]) {
             }
         }
     }
+
+    THREAD_cleanup();
 
     return 0;
 }

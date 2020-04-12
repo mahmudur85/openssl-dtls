@@ -12,7 +12,7 @@ set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -Wall")
 set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DDEBUG")
 
 # enable this to use EPOLL event data pointer
-#set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DWITH_EPOLL_DATA_PTR")
+set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DWITH_EPOLL_DATA_PTR")
 
 file(GLOB SRC_FILES src/*.cpp src/*.hpp src/*.c src/*.h)
 
