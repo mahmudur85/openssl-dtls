@@ -14,6 +14,10 @@ set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DDEBUG")
 # enable this to use EPOLL event data pointer
 set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DWITH_EPOLL_DATA_PTR")
 
+# enable non-blocking socket
+# NOTE: DTLSv1_listen() misses dose not support non-blocking socket connection
+set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DSOCK_NON_BLOCKING")
+
 file(GLOB SRC_FILES src/*.cpp src/*.hpp src/*.c src/*.h)
 
 include_directories(include)

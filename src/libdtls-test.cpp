@@ -3,7 +3,6 @@
  * https://gist.github.com/Jxck/b211a12423622fe304d2370b1f1d30d5
  */
 
-
 #include <string>
 #include <iostream>
 #include <cstdio>
@@ -44,7 +43,7 @@ using namespace std;
 #define BUFSIZE 2048
 #define COOKIE_SECRET_LENGTH 16
 
-static pthread_mutex_t* mutex_buf = NULL;
+static pthread_mutex_t *mutex_buf = NULL;
 
 struct pass_info {
     union {
@@ -52,9 +51,32 @@ struct pass_info {
         struct sockaddr_in6 s6;
         struct sockaddr_in s4;
     } client_addr;
-    struct addrinfo server;
+    struct addrinfo server_address;
+    int epoll_fd;
     SSL *ssl;
 };
+
+typedef struct server_info_t {
+    struct addrinfo address;
+    int server_fd;
+    int epoll_fd;
+    SSL_CTX *ctx;
+    bool running;
+} server_info;
+
+typedef struct client_info_t {
+    struct addrinfo server_address;
+    union {
+        struct sockaddr_storage ss;
+        struct sockaddr_in6 s6;
+        struct sockaddr_in s4;
+    } client_addr;
+    SSL *ssl;
+    int client_fd;
+    int epoll_fd;
+    int num_timeouts;
+    int state;
+} client_info;
 
 enum ContextType {
     DEVICE = 1, TUNNEL = 2, CLIENT = 3
@@ -63,8 +85,10 @@ enum ContextType {
 typedef struct Context_t {
     ContextType type;
     int fd;
-    // void *ptr;
+    void *ptr;
 } Context;
+
+const static int max_timeout = 5;
 
 int verify_depth = 0;
 int verify_quiet = 0;
@@ -90,11 +114,11 @@ static unsigned long id_function(void) {
 int THREAD_setup() {
     int i;
 
-    mutex_buf = (pthread_mutex_t*) malloc(CRYPTO_num_locks() * sizeof(pthread_mutex_t));
+    mutex_buf = (pthread_mutex_t *) malloc(CRYPTO_num_locks() * sizeof(pthread_mutex_t));
     if (!mutex_buf)
         return 0;
     for (i = 0; i < CRYPTO_num_locks(); i++)
-            pthread_mutex_init(&mutex_buf[i], NULL);
+        pthread_mutex_init(&mutex_buf[i], NULL);
     CRYPTO_set_id_callback(id_function);
     CRYPTO_set_locking_callback(locking_function);
     return 1;
@@ -109,7 +133,7 @@ int THREAD_cleanup() {
     CRYPTO_set_id_callback(NULL);
     CRYPTO_set_locking_callback(NULL);
     for (i = 0; i < CRYPTO_num_locks(); i++)
-            pthread_mutex_destroy(&mutex_buf[i]);
+        pthread_mutex_destroy(&mutex_buf[i]);
     free(mutex_buf);
     mutex_buf = NULL;
     return 1;
@@ -125,7 +149,7 @@ static void dtls_report_err(char *fmt, ...) {
     va_end(args);
 }
 
-static int dtls_verify_callback (int ok, X509_STORE_CTX *ctx) {
+static int dtls_verify_callback(int ok, X509_STORE_CTX *ctx) {
     /* This function should ask the user
      * if he trusts the received certificate.
      * Here we always trust.
@@ -279,7 +303,6 @@ static int verify_cookie(SSL *ssl, const unsigned char *cookie, unsigned int coo
     return 0;
 }
 
-
 static void info_callback(const SSL *ssl, int where, int ret) {
     const char *str;
     int w;
@@ -307,6 +330,65 @@ static void info_callback(const SSL *ssl, int where, int ret) {
     }
 }
 
+int handle_socket_error() {
+    switch (errno) {
+        case EINTR:
+            /* Interrupted system call.
+             * Just ignore.
+             */
+            printf("Interrupted system call!\n");
+            return 1;
+        case EBADF:
+            /* Invalid socket.
+             * Must close connection.
+             */
+            printf("Invalid socket!\n");
+            return 0;
+            break;
+#ifdef EHOSTDOWN
+        case EHOSTDOWN:
+            /* Host is down.
+             * Just ignore, might be an attacker
+             * sending fake ICMP messages.
+             */
+            printf("Host is down!\n");
+            return 1;
+#endif
+#ifdef ECONNRESET
+        case ECONNRESET:
+            /* Connection reset by peer.
+             * Just ignore, might be an attacker
+             * sending fake ICMP messages.
+             */
+            printf("Connection reset by peer!\n");
+            return 1;
+            break;
+#endif
+        case ENOMEM:
+            /* Out of memory.
+             * Must close connection.
+             */
+            printf("Out of memory!\n");
+            return 0;
+            break;
+        case EACCES:
+            /* Permission denied.
+             * Just ignore, we might be blocked
+             * by some firewall policy. Try again
+             * and hope for the best.
+             */
+            printf("Permission denied!\n");
+            return 1;
+            break;
+        default:
+            /* Something unexpected happened */
+            printf("Unexpected error! (errno = %d)\n", errno);
+            return 0;
+            break;
+    }
+    return 0;
+}
+
 void signal_handler(int sig) {
     if (sig == SIGINT)
         fprintf(stderr, "Interrupt from keyboard\n");
@@ -314,7 +396,6 @@ void signal_handler(int sig) {
         fprintf(stderr, "unknown signal[%d]\n", sig);
     fflush(stderr);
 }
-
 
 bool make_socket_non_blocking(int fd) {
     int flags, s;
@@ -335,7 +416,6 @@ bool make_socket_non_blocking(int fd) {
     return true;
 }
 
-
 int get_server_socket_and_bind(std::string &bind_addr, std::string &port, struct addrinfo *server) {
     int sock = -1;
     struct addrinfo host;
@@ -345,9 +425,10 @@ int get_server_socket_and_bind(std::string &bind_addr, std::string &port, struct
     int s;
 
     memset(&host, 0, sizeof(struct addrinfo));
-    host.ai_family   = AF_INET;
-    host.ai_socktype = SOCK_DGRAM/* | SOCK_NONBLOCK | SOCK_CLOEXEC*/; // UDP
-    host.ai_flags    = AI_PASSIVE;
+    host.ai_family = AF_INET;
+    host.ai_socktype = SOCK_DGRAM;
+    host.ai_flags = AI_PASSIVE;
+    host.ai_protocol = 0;
 
     s = getaddrinfo(bind_addr.c_str(), port.c_str(), &host, &result);
     if (s != 0) {
@@ -386,22 +467,24 @@ int get_server_socket_and_bind(std::string &bind_addr, std::string &port, struct
 
     freeaddrinfo(result);
 
-    if(!make_socket_non_blocking(sock)){
+#ifdef SOCK_NON_BLOCKING
+    if (!make_socket_non_blocking(sock)) {
         perror("Could make socket non blocking");
         return false;
     }
+#endif
 
     return sock;
 }
 
-void* connection_handle(void *info) {
-    // ssize_t len, rlen;
+void *connection_handle(void *info) {
     int optval = 1;
     char buf[BUFSIZE];
-    // char rcvbuf[BUFSIZE];
+    struct epoll_event event = {};
     struct timeval timeout;
+    client_info *client = nullptr;
 
-    struct pass_info *pinfo = (struct pass_info*) info;
+    struct pass_info *pinfo = (struct pass_info *) info;
     SSL *ssl = pinfo->ssl;
     int fd;
     int ret;
@@ -410,7 +493,7 @@ void* connection_handle(void *info) {
 
     pthread_detach(pthread_self());
 
-    OPENSSL_assert(pinfo->client_addr.ss.ss_family == pinfo->server.ai_family);
+    OPENSSL_assert(pinfo->client_addr.ss.ss_family == pinfo->server_address.ai_family);
     fd = socket(pinfo->client_addr.ss.ss_family, SOCK_DGRAM, 0);
     if (fd < 0) {
         perror("client socket");
@@ -423,7 +506,7 @@ void* connection_handle(void *info) {
         goto cleanup;
     }
 
-    if (bind(fd, pinfo->server.ai_addr, pinfo->server.ai_addrlen) < 0) {
+    if (bind(fd, pinfo->server_address.ai_addr, pinfo->server_address.ai_addrlen) < 0) {
         perror("client bind())");
         close(fd);
         goto cleanup;
@@ -435,10 +518,12 @@ void* connection_handle(void *info) {
         goto cleanup;
     }
 
+#ifdef SOCK_NON_BLOCKING
     if (!make_socket_non_blocking(fd)) {
         close(fd);
         goto cleanup;
     }
+#endif
 
     /* Set new fd and set BIO to connected */
     BIO_set_fd(SSL_get_rbio(ssl), fd, BIO_NOCLOSE);
@@ -458,32 +543,50 @@ void* connection_handle(void *info) {
     timeout.tv_usec = 0;
     BIO_ctrl(SSL_get_rbio(ssl), BIO_CTRL_DGRAM_SET_RECV_TIMEOUT, 0, &timeout);
 
-    SSL_shutdown(ssl);
+    // add client to epoll event
+    client = (client_info *) malloc(sizeof(client_info));
+    if (client != nullptr) {
+        memcpy(&client->server_address, &pinfo->server_address, sizeof(struct addrinfo));
+        memcpy(&client->client_addr, &pinfo->client_addr, sizeof(struct sockaddr_storage));
+        client->ssl = pinfo->ssl;
+        client->client_fd = fd;
+        client->epoll_fd = pinfo->epoll_fd;
+        client->num_timeouts = 0;
+        client->state = 1;
+
+        // add client to epoll
+        auto *context = new Context;
+        context->ptr = (void *) client;
+        context->fd = fd;
+        context->type = CLIENT;
+
+        event.data.ptr = context;
+        event.events = EPOLLIN | EPOLLET;
+        if (epoll_ctl(pinfo->epoll_fd, EPOLL_CTL_ADD, fd, &event) < 0) {
+            perror("epoll_ctl()");
+            SSL_shutdown(ssl);
+            delete context;
+            free(client);
+            goto cleanup;
+        }
+    }
+
+    if(client->state) {
+        free(info);
+        dprint("\nThread %lx: done, new connection created.\n", (long) pthread_self());
+        pthread_exit((void *) NULL);
+    }
 
 cleanup:
     close(fd);
     free(info);
     SSL_free(ssl);
-    dprint("Thread %lx: done, connection closed.\n", (long) pthread_self());
-    pthread_exit( (void *) NULL );
+    dprint("Thread %lx: done, connection closed due to error.\n", (long) pthread_self());
+    pthread_exit((void *) NULL);
 }
 
-
-int main(int argc, char *argv[]) {
-    struct addrinfo server;
-    int server_fd, epoll_fd, pid;
-    struct epoll_event event = {};
-    bool running = true;
-
+void dtls_listener(server_info *sinfo) {
     pthread_t tid;
-
-    int ev_num;
-    struct epoll_event events[10];
-    // time_t last_time=0, time_now=0;
-
-    std::string bind_addr("192.168.2.2");
-    std::string bind_port("9000");
-
     union {
         struct sockaddr_storage ss;
         struct sockaddr_in6 s6;
@@ -492,10 +595,98 @@ int main(int argc, char *argv[]) {
     struct pass_info *info;
     SSL *ssl;
     BIO *bio;
-    SSL_CTX *ctx;
     struct timeval timeout;
 
     THREAD_setup();
+
+    while (sinfo->running) {
+        dprint("waiting for listen event....\n");
+        //clear client address buffer
+        memset(&client_addr, 0, sizeof(struct sockaddr_storage));
+
+        // create bio
+        bio = BIO_new_dgram(sinfo->server_fd, BIO_NOCLOSE);
+
+        /* Set and activate timeouts */
+        timeout.tv_sec = 5;
+        timeout.tv_usec = 0;
+        BIO_ctrl(bio, BIO_CTRL_DGRAM_SET_RECV_TIMEOUT, 0, &timeout);
+
+        ssl = SSL_new(sinfo->ctx);
+
+        SSL_set_bio(ssl, bio, bio);
+        SSL_set_options(ssl, SSL_OP_COOKIE_EXCHANGE);
+
+        while (DTLSv1_listen(ssl, (BIO_ADDR *) &client_addr) <= 0);
+
+        info = (struct pass_info *) malloc(sizeof(struct pass_info));
+
+        info->epoll_fd = sinfo->epoll_fd;
+        memcpy(&info->server_address, &sinfo->address, sizeof(struct addrinfo));
+        memcpy(&info->client_addr, &client_addr, sizeof(struct sockaddr_storage));
+        info->ssl = ssl;
+
+        if (pthread_create(&tid, NULL, connection_handle, info) != 0) {
+            perror("pthread_create");
+            exit(-1);
+        }
+    }
+
+    THREAD_cleanup();
+}
+
+int send_to_client(client_info *client, const void * buf, int length){
+    int count = -1;
+    int len = SSL_write(client->ssl, buf, length);
+
+    switch (SSL_get_error(client->ssl, len)) {
+        case SSL_ERROR_NONE:
+            printf("\nThread %lx: sent '%s' with %d bytes\n",  (long) pthread_self(),
+                   (char *) buf, len);
+            count = len;
+            break;
+        case SSL_ERROR_WANT_WRITE:
+            /* Just try again later */
+            count = 0;
+            break;
+        case SSL_ERROR_WANT_READ:
+            /* continue with reading */
+            count = 0;
+            break;
+        case SSL_ERROR_SYSCALL:
+            printf("Socket write error: ");
+            if (!handle_socket_error()) count = -1;
+            break;
+        case SSL_ERROR_SSL:
+            count = -1;
+            printf("SSL write error: ");
+            printf("%s (%d)\n", ERR_error_string(ERR_get_error(), (char *) buf), SSL_get_error(client->ssl, len));
+            break;
+        default:
+            count = -1;
+            printf("Unexpected error while writing!\n");
+            break;
+    }
+
+    return count;
+}
+
+
+int main(int argc, char *argv[]) {
+    server_info *sinfo;
+    int pid;
+    struct epoll_event event = {};
+    bool running = true;
+
+    int ev_num;
+    struct epoll_event events[10];
+    // time_t last_time=0, time_now=0;
+
+    std::string bind_addr("192.168.2.2");
+    std::string bind_port("9000");
+
+    /*
+    SSL_CTX *ctx;*/
     OpenSSL_add_all_algorithms();
     ERR_load_BIO_strings();
     ERR_load_crypto_strings();
@@ -506,71 +697,61 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
+    sinfo = (server_info *) malloc(sizeof(server_info));
+
     const SSL_METHOD *mtd = DTLS_server_method();
-    ctx = SSL_CTX_new(mtd);
-    SSL_CTX_set_min_proto_version(ctx, DTLS1_2_VERSION);
+    sinfo->ctx = SSL_CTX_new(mtd);
+    SSL_CTX_set_min_proto_version(sinfo->ctx, DTLS1_2_VERSION);
 
     pid = getpid();
-    if (!SSL_CTX_set_session_id_context(ctx, (const unsigned char *) &pid, sizeof pid)) {
+    if (!SSL_CTX_set_session_id_context(sinfo->ctx, (const unsigned char *) &pid, sizeof pid)) {
         perror("SSL_CTX_set_session_id_context");
         exit(EXIT_FAILURE);
     }
 
-    if (!SSL_CTX_use_certificate_file(ctx, "../certs/server-cert.pem", SSL_FILETYPE_PEM)) {
+    if (!SSL_CTX_use_certificate_file(sinfo->ctx, "../certs/server-cert.pem", SSL_FILETYPE_PEM)) {
         printf("\n[%d] ERROR: no certificate found!", __LINE__);
         ERR_print_errors_fp(stderr);
         exit(EXIT_FAILURE);
     }
 
-    if (!SSL_CTX_use_PrivateKey_file(ctx, "../certs/server-key.pem", SSL_FILETYPE_PEM)) {
+    if (!SSL_CTX_use_PrivateKey_file(sinfo->ctx, "../certs/server-key.pem", SSL_FILETYPE_PEM)) {
         printf("\n[%d] ERROR: no private key found!", __LINE__);
         exit(EXIT_FAILURE);
     }
 
-    if (!SSL_CTX_check_private_key(ctx)) {
+    if (!SSL_CTX_check_private_key(sinfo->ctx)) {
         printf("\n[%d] ERROR: invalid private key!", __LINE__);
         exit(EXIT_FAILURE);
     }
 
     /* Client has to authenticate */
-    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_CLIENT_ONCE, dtls_verify_callback);
-    SSL_CTX_set_cookie_generate_cb(ctx, generate_cookie);
-    SSL_CTX_set_cookie_verify_cb(ctx, verify_cookie);
-    SSL_CTX_set_info_callback(ctx, info_callback);
-
-    server_fd = get_server_socket_and_bind(bind_addr, bind_port, &server);
-
-    if(server_fd < 0){
-        exit(1);
-    }
-
-    epoll_fd = epoll_create1(EPOLL_CLOEXEC);
-    if (epoll_fd == -1) {
-        exit(1);
-    }
-
-#ifndef WITH_EPOLL_DATA_PTR
-    // Add the Tunnel to epoll
-    event.data.fd = server_fd;
-#else
-    // Add the Tunnel to epoll
-    auto *serverCtx = new Context;
-    // serverCtx->ptr = tunnel_var;
-    serverCtx->fd = server_fd;
-    serverCtx->type = TUNNEL;
-    event.data.ptr = serverCtx;
+    SSL_CTX_set_verify(sinfo->ctx, SSL_VERIFY_PEER | SSL_VERIFY_CLIENT_ONCE, dtls_verify_callback);
+    SSL_CTX_set_cookie_generate_cb(sinfo->ctx, generate_cookie);
+    SSL_CTX_set_cookie_verify_cb(sinfo->ctx, verify_cookie);
+#ifdef DEBUG
+    SSL_CTX_set_info_callback(sinfo->ctx, info_callback);
 #endif
-    event.events = EPOLLIN | EPOLLET;
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &event) < 0) {
+
+    sinfo->server_fd = get_server_socket_and_bind(bind_addr, bind_port, &sinfo->address);
+
+    if (sinfo->server_fd < 0) {
         exit(1);
     }
 
-    while (running){
-        dprint("waiting for en event....\n");
+    sinfo->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    if (sinfo->epoll_fd == -1) {
+        exit(1);
+    }
+
+    std::thread dtlsListenThread(dtls_listener, sinfo);
+
+    while (running) {
+        //dprint("waiting for epoll event....\n");
         // Wait for something to happen on one of the file descriptors
         // we are waiting on
         do {
-            ev_num = epoll_wait(epoll_fd, events, MAX_TUNNEL_EVENTS, EPOLL_TIMEOUT);
+            ev_num = epoll_wait(sinfo->epoll_fd, events, MAX_TUNNEL_EVENTS, -1);
         } while (ev_num == -1 && errno == EINTR);
         if (ev_num < 0) {
             if (errno == EINTR) {
@@ -586,14 +767,14 @@ int main(int argc, char *argv[]) {
 
         // time_now = time(NULL);
 
-        for(int i=0; i < ev_num; i++){
+        for (int i = 0; i < ev_num; i++) {
 #ifdef WITH_EPOLL_DATA_PTR
-            auto context = (Context *) (events[i].data.ptr);
+            auto *context = (Context *) (events[i].data.ptr);
 #endif
 
             if ((events[i].events & EPOLLERR) ||
                 (events[i].events & EPOLLHUP) ||
-                (!(events[i].events & EPOLLIN))){
+                (!(events[i].events & EPOLLIN))) {
                 /* An error has occured on this fd, or the socket is not
                    ready for reading (why were we notified then?) */
                 perror("epoll error");
@@ -604,60 +785,89 @@ int main(int argc, char *argv[]) {
 #endif
                 continue;
             }
+
 #ifndef WITH_EPOLL_DATA_PTR
             if(events[i].data.fd < 0){
                 derror("invalid epoll event. fd:%d\n", events[i].data.fd);
                 continue;
             }
 #else
-            if(context->fd < 0){
+            if (context->fd < 0) {
                 derror("invalid epoll event. fd:%d\n", context->fd);
                 continue;
             }
 #endif
+            auto *client = (client_info *) context->ptr;
 
-            if((events[i].events & EPOLLIN)){
-                /*char buffer[BUFSIZE];
-                int rlen;
-                socklen_t sock_len;*/
+            if ((events[i].events & EPOLLIN)) {
+                char rcvbuf[BUFSIZE];
 
-                memset(&client_addr, 0, sizeof(struct sockaddr_storage));
+                if (!SSL_get_shutdown(client->ssl)) {
+                    int rlen = SSL_read(client->ssl, rcvbuf, sizeof(rcvbuf));
+                    switch (SSL_get_error(client->ssl, rlen)) {
+                        case SSL_ERROR_NONE:
+                            rcvbuf[rlen] = '\0';
+                            printf("\nThread %lx: received '%s' with %d bytes\n", (long) pthread_self(), rcvbuf,
+                                   (int) rlen);
+                            //echo back the received packet
+                            if(send_to_client(client, (const void *) rcvbuf, rlen) < 0) {
+                                client->state = 0;
+                            }
+                            break;
+                        case SSL_ERROR_WANT_READ:
+                            /* Handle socket timeouts */
+                            if (BIO_ctrl(SSL_get_rbio(client->ssl), BIO_CTRL_DGRAM_GET_RECV_TIMER_EXP, 0, NULL)) {
+                                client->num_timeouts++;
+                                if (client->num_timeouts == max_timeout){
+                                    client->state = 0;
+                                }
+                            }
+                            /* Just try again */
+                            break;
+                        case SSL_ERROR_ZERO_RETURN:
+                            break;
+                        case SSL_ERROR_SYSCALL:
+                            printf("Socket read error: ");
+                            if (!handle_socket_error()) client->state = 0;
+                            break;
+                        case SSL_ERROR_SSL:
+                            printf("SSL read error: ");
+                            printf("%s (%d)\n", ERR_error_string(ERR_get_error(), rcvbuf),
+                                   SSL_get_error(client->ssl, rlen));
+                            client->state = 0;
+                            break;
+                        default:
+                            printf("Unexpected error while reading!\n");
+                            client->state = 0;
+                            break;
+                    }
+                }else{
+                    client->state = 0;
+                }
 
-#ifndef WITH_EPOLL_DATA_PTR
-                /* Create BIO */
-                bio = BIO_new_dgram(events[i].data.fd, BIO_NOCLOSE);
-#else
-                /* Create BIO */
-                bio = BIO_new_dgram(context->fd, BIO_NOCLOSE);
-#endif
-
-                /* Set and activate timeouts */
-                timeout.tv_sec = 5;
-                timeout.tv_usec = 0;
-                BIO_ctrl(bio, BIO_CTRL_DGRAM_SET_RECV_TIMEOUT, 0, &timeout);
-
-                ssl = SSL_new(ctx);
-
-                SSL_set_bio(ssl, bio, bio);
-                SSL_set_options(ssl, SSL_OP_COOKIE_EXCHANGE);
-
-                while (DTLSv1_listen(ssl, (BIO_ADDR *) &client_addr) <= 0);
-
-                info = (struct pass_info*) malloc (sizeof(struct pass_info));
-
-                memcpy(&info->server, &server, sizeof(struct addrinfo));
-                memcpy(&info->client_addr, &client_addr, sizeof(struct sockaddr_storage));
-                info->ssl = ssl;
-
-                if (pthread_create( &tid, NULL, connection_handle, info) != 0) {
-                    perror("pthread_create");
-                    exit(-1);
+                if(!client->state) {
+                    //remove from epoll
+                    try {
+                        epoll_ctl(client->epoll_fd, EPOLL_CTL_DEL, client->client_fd, nullptr);
+                        dprint("client '%s:%s' removed from epoll events\n",
+                               inet_ntoa(((struct sockaddr_in *) &client->client_addr)->sin_addr),
+                               ntohs(((struct sockaddr_in *) &client->client_addr)->sin_port));
+                    }catch (exception& e){
+                        derror("exception occurred while removing '%s':%s from epoll event control: %s",
+                               inet_ntoa(((struct sockaddr_in *) &client->client_addr)->sin_addr),
+                               ntohs(((struct sockaddr_in *) &client->client_addr)->sin_port), e.what());
+                    }
+                    SSL_shutdown(client->ssl);
+                    close(client->client_fd);
+                    SSL_free(client->ssl);
                 }
             }
         }
     }
 
-    THREAD_cleanup();
+    sinfo->running = false;
+    dtlsListenThread.join();
+    free(sinfo);
 
     return 0;
 }
