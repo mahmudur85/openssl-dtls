@@ -32,6 +32,9 @@
 #include <openssl/err.h>
 #include <openssl/rand.h>
 #include <openssl/x509v3.h>
+#include <unordered_map>
+
+#include "Timer.hpp"
 
 using namespace std;
 
@@ -39,30 +42,13 @@ using namespace std;
 #define derror(a, b...) fprintf(stderr, "\n[DTLS ERROR] %s[%d]: " a "\n", __func__, __LINE__, ##b)
 
 #define EPOLL_TIMEOUT 1000 // miliseconds
+#define IDLE_CONNECTION_TIMER_INTERVAL 5 // seconds
+#define SOCKET_IDLE_TIMEOUT 5 // seconds
 #define MAX_TUNNEL_EVENTS 10
 #define BUFSIZE 2048
 #define COOKIE_SECRET_LENGTH 16
 
 static pthread_mutex_t *mutex_buf = NULL;
-
-struct pass_info {
-    union {
-        struct sockaddr_storage ss;
-        struct sockaddr_in6 s6;
-        struct sockaddr_in s4;
-    } client_addr;
-    struct addrinfo server_address;
-    int epoll_fd;
-    SSL *ssl;
-};
-
-typedef struct server_info_t {
-    struct addrinfo address;
-    int server_fd;
-    int epoll_fd;
-    SSL_CTX *ctx;
-    bool running;
-} server_info;
 
 typedef struct client_info_t {
     struct addrinfo server_address;
@@ -76,7 +62,30 @@ typedef struct client_info_t {
     int epoll_fd;
     int num_timeouts;
     int state;
+    long last_activity;
+    unordered_map<in_addr_t, client_info_t *> *map;
 } client_info;
+
+typedef struct server_info_t {
+    struct addrinfo address;
+    int server_fd;
+    int epoll_fd;
+    SSL_CTX *ctx;
+    bool running;
+    unordered_map<in_addr_t, client_info_t *> conn_map;
+} server_info;
+
+struct pass_info {
+    union {
+        struct sockaddr_storage ss;
+        struct sockaddr_in6 s6;
+        struct sockaddr_in s4;
+    } client_addr;
+    struct addrinfo server_address;
+    int epoll_fd;
+    SSL *ssl;
+    unordered_map<in_addr_t, client_info_t *> *map;
+};
 
 enum ContextType {
     DEVICE = 1, TUNNEL = 2, CLIENT = 3
@@ -482,7 +491,9 @@ void *connection_handle(void *info) {
     char buf[BUFSIZE];
     struct epoll_event event = {};
     struct timeval timeout;
-    client_info *client = nullptr;
+    time_t  time_now = 0;
+    client_info *cinfo = nullptr;
+    Context *context = nullptr;
 
     struct pass_info *pinfo = (struct pass_info *) info;
     SSL *ssl = pinfo->ssl;
@@ -544,42 +555,41 @@ void *connection_handle(void *info) {
     BIO_ctrl(SSL_get_rbio(ssl), BIO_CTRL_DGRAM_SET_RECV_TIMEOUT, 0, &timeout);
 
     // add client to epoll event
-    client = (client_info *) malloc(sizeof(client_info));
-    if (client != nullptr) {
-        memcpy(&client->server_address, &pinfo->server_address, sizeof(struct addrinfo));
-        memcpy(&client->client_addr, &pinfo->client_addr, sizeof(struct sockaddr_storage));
-        client->ssl = pinfo->ssl;
-        client->client_fd = fd;
-        client->epoll_fd = pinfo->epoll_fd;
-        client->num_timeouts = 0;
-        client->state = 1;
+    cinfo = new client_info;
+    memcpy(&cinfo->server_address, &pinfo->server_address, sizeof(struct addrinfo));
+    memcpy(&cinfo->client_addr, &pinfo->client_addr, sizeof(struct sockaddr_storage));
+    cinfo->ssl = pinfo->ssl;
+    cinfo->client_fd = fd;
+    cinfo->epoll_fd = pinfo->epoll_fd;
+    cinfo->num_timeouts = 0;
+    cinfo->state = 1;
+    cinfo->map = pinfo->map;
+    cinfo->last_activity = time_now;
 
-        // add client to epoll
-        auto *context = new Context;
-        context->ptr = (void *) client;
-        context->fd = fd;
-        context->type = CLIENT;
-
-        event.data.ptr = context;
-        event.events = EPOLLIN | EPOLLET;
-        if (epoll_ctl(pinfo->epoll_fd, EPOLL_CTL_ADD, fd, &event) < 0) {
-            perror("epoll_ctl()");
+    context = new Context;
+    context->ptr = (void *) cinfo;
+    context->fd = fd;
+    context->type = CLIENT;
+    event.data.ptr = context;
+    event.events = EPOLLIN | EPOLLET;
+    if (epoll_ctl(pinfo->epoll_fd, EPOLL_CTL_ADD, fd, &event) < 0) {
+        perror("epoll_ctl()");
+        if(SSL_shutdown(ssl) == 0){
             SSL_shutdown(ssl);
-            delete context;
-            free(client);
-            goto cleanup;
         }
+        delete context;
+        delete cinfo;
+        goto cleanup;
     }
+    (*cinfo->map)[cinfo->client_addr.s4.sin_addr.s_addr] = cinfo;
 
-    if(client->state) {
-        free(info);
-        dprint("\nThread %lx: done, new connection created.\n", (long) pthread_self());
-        pthread_exit((void *) NULL);
-    }
+    delete info;
+    dprint("\nThread %lx: done, new connection created.\n", (long) pthread_self());
+    pthread_exit((void *) NULL);
 
 cleanup:
     close(fd);
-    free(info);
+    delete info;
     SSL_free(ssl);
     dprint("Thread %lx: done, connection closed due to error.\n", (long) pthread_self());
     pthread_exit((void *) NULL);
@@ -619,14 +629,17 @@ void dtls_listener(server_info *sinfo) {
 
         while (DTLSv1_listen(ssl, (BIO_ADDR *) &client_addr) <= 0);
 
-        info = (struct pass_info *) malloc(sizeof(struct pass_info));
+        info = new pass_info;
 
         info->epoll_fd = sinfo->epoll_fd;
         memcpy(&info->server_address, &sinfo->address, sizeof(struct addrinfo));
         memcpy(&info->client_addr, &client_addr, sizeof(struct sockaddr_storage));
         info->ssl = ssl;
+        info->map = &sinfo->conn_map;
 
         if (pthread_create(&tid, NULL, connection_handle, info) != 0) {
+            SSL_free(ssl);
+            delete info;
             perror("pthread_create");
             exit(-1);
         }
@@ -671,16 +684,58 @@ int send_to_client(client_info *client, const void * buf, int length){
     return count;
 }
 
+static void remove_client(client_info *cinfo){
+    if(cinfo) {
+        //remove from epoll
+        try {
+            epoll_ctl(cinfo->epoll_fd, EPOLL_CTL_DEL, cinfo->client_fd, nullptr);
+            /*dprint("client '%s:%s' removed from epoll events\n",
+                   inet_ntoa(((struct sockaddr_in *) &cinfo->client_addr)->sin_addr),
+                   ntohs(((struct sockaddr_in *) &cinfo->client_addr)->sin_port));*/
+        } catch (exception &e) {
+            derror("exception occurred while removing '%s':%s from epoll event control: %s",
+                   inet_ntoa(((struct sockaddr_in *) &cinfo->client_addr)->sin_addr),
+                   ntohs(((struct sockaddr_in *) &cinfo->client_addr)->sin_port), e.what());
+        }
+        if(SSL_shutdown(cinfo->ssl) == 0){
+            SSL_shutdown(cinfo->ssl);
+        }
+        close(cinfo->client_fd);
+        SSL_free(cinfo->ssl);
+        // remove from map
+        (*cinfo->map).erase(cinfo->client_addr.s4.sin_addr.s_addr);
+        delete cinfo;
+    }
+}
+
+void idle_connection_time_handler(size_t timer_id, void *user_data){
+    struct timeval now = {};
+    auto *sinfo = (server_info *) user_data;
+    dprint("timer[%ld]: timer event, checking idle client connection\n", timer_id);
+    gettimeofday(&now, nullptr);
+
+    for( auto& client: sinfo->conn_map) {
+        if((now.tv_sec - client.second->last_activity) >= SOCKET_IDLE_TIMEOUT) {
+            struct sockaddr_in addr{};
+            addr.sin_addr.s_addr = client.first;
+            dprint("timer[%ld]: removing %s due as it was inactive for %d seconds\n", timer_id,
+                   inet_ntoa(addr.sin_addr), SOCKET_IDLE_TIMEOUT);
+            std::thread removeClientThread(remove_client, client.second);
+            removeClientThread.detach();
+        }
+    }
+}
 
 int main(int argc, char *argv[]) {
     server_info *sinfo;
     int pid;
     struct epoll_event event = {};
     bool running = true;
+    size_t idel_connection_timer = 0;
 
     int ev_num;
     struct epoll_event events[10];
-    // time_t last_time=0, time_now=0;
+    time_t time_now=0;
 
     std::string bind_addr("192.168.2.2");
     std::string bind_port("9000");
@@ -697,7 +752,7 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    sinfo = (server_info *) malloc(sizeof(server_info));
+    sinfo = new server_info;
 
     const SSL_METHOD *mtd = DTLS_server_method();
     sinfo->ctx = SSL_CTX_new(mtd);
@@ -746,8 +801,12 @@ int main(int argc, char *argv[]) {
 
     std::thread dtlsListenThread(dtls_listener, sinfo);
 
+    Timer::initialize();
+    /*idel_connection_timer = Timer::start_timer(IDLE_CONNECTION_TIMER_INTERVAL, t_unit::SEC, idle_connection_time_handler,
+                                               t_timer::TIMER_PERIODIC, sinfo);*/
+
     while (running) {
-        //dprint("waiting for epoll event....\n");
+        dprint("waiting for epoll event....\n");
         // Wait for something to happen on one of the file descriptors
         // we are waiting on
         do {
@@ -765,7 +824,7 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // time_now = time(NULL);
+        time_now = time(NULL);
 
         for (int i = 0; i < ev_num; i++) {
 #ifdef WITH_EPOLL_DATA_PTR
@@ -798,21 +857,23 @@ int main(int argc, char *argv[]) {
             }
 #endif
             auto *client = (client_info *) context->ptr;
-
+            client->last_activity = time_now;
             if ((events[i].events & EPOLLIN)) {
                 char rcvbuf[BUFSIZE];
+                char sentbuf[BUFSIZE];
 
                 if (!SSL_get_shutdown(client->ssl)) {
                     int rlen = SSL_read(client->ssl, rcvbuf, sizeof(rcvbuf));
-                    switch (SSL_get_error(client->ssl, rlen)) {
+                    int ssl_err = SSL_get_error(client->ssl, rlen);
+                    switch (ssl_err) {
                         case SSL_ERROR_NONE:
                             rcvbuf[rlen] = '\0';
                             printf("\nThread %lx: received '%s' with %d bytes\n", (long) pthread_self(), rcvbuf,
                                    (int) rlen);
+                            sprintf(sentbuf, "received->'%s'",rcvbuf);
                             //echo back the received packet
-                            if(send_to_client(client, (const void *) rcvbuf, rlen) < 0) {
-                                client->state = 0;
-                            }
+                            if(send_to_client(client, (const void *) sentbuf, (int) strlen(sentbuf)) < 0)
+                            client->state = 0;
                             break;
                         case SSL_ERROR_WANT_READ:
                             /* Handle socket timeouts */
@@ -825,6 +886,7 @@ int main(int argc, char *argv[]) {
                             /* Just try again */
                             break;
                         case SSL_ERROR_ZERO_RETURN:
+                            client->state = 0;
                             break;
                         case SSL_ERROR_SYSCALL:
                             printf("Socket read error: ");
@@ -847,27 +909,23 @@ int main(int argc, char *argv[]) {
 
                 if(!client->state) {
                     //remove from epoll
-                    try {
-                        epoll_ctl(client->epoll_fd, EPOLL_CTL_DEL, client->client_fd, nullptr);
-                        dprint("client '%s:%s' removed from epoll events\n",
-                               inet_ntoa(((struct sockaddr_in *) &client->client_addr)->sin_addr),
-                               ntohs(((struct sockaddr_in *) &client->client_addr)->sin_port));
-                    }catch (exception& e){
-                        derror("exception occurred while removing '%s':%s from epoll event control: %s",
-                               inet_ntoa(((struct sockaddr_in *) &client->client_addr)->sin_addr),
-                               ntohs(((struct sockaddr_in *) &client->client_addr)->sin_port), e.what());
-                    }
-                    SSL_shutdown(client->ssl);
-                    close(client->client_fd);
-                    SSL_free(client->ssl);
+                    remove_client(client);
                 }
             }
         }
     }
 
+    if (idel_connection_timer > 0) {
+        Timer::stop_timer(idel_connection_timer);
+    }
+
     sinfo->running = false;
+    for (auto &it : sinfo->conn_map) {
+        delete it.second;
+    }
+    sinfo->conn_map.clear();
     dtlsListenThread.join();
-    free(sinfo);
+    delete sinfo;
 
     return 0;
 }
