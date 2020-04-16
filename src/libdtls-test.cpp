@@ -99,11 +99,7 @@ typedef struct Context_t {
 
 const static int max_timeout = 5;
 
-int verify_depth = 0;
-int verify_quiet = 0;
-int verify_error = X509_V_OK;
-int verify_return_error = 0;
-BIO *dtls_bio_err = NULL;
+server_info *sinfo;
 
 int cookie_initialized;
 unsigned char cookie_secret[COOKIE_SECRET_LENGTH];
@@ -337,6 +333,51 @@ static void info_callback(const SSL *ssl, int where, int ret) {
             dtls_report_err((char *) "\t.. %s:error in %s\n", str, SSL_state_string_long(ssl));
         }
     }
+}
+
+void sig_handler(int signo) {
+    if (signo == SIGINT)
+        derror("received SIGINT");
+    if (signo == SIGABRT)
+        derror("received SIGABRT");
+    if (signo == SIGSEGV)
+        derror("received SIGSEGV");
+
+    derror("Shutdown Initiating");
+
+    if(sinfo) {
+
+        for (auto &it : sinfo->conn_map) {
+            if(it.second->ssl) {
+                if(SSL_shutdown(it.second->ssl) == 0) {
+                    SSL_shutdown(it.second->ssl);
+                }
+                SSL_free(it.second->ssl);
+            }
+            close(it.second->client_fd);
+            delete it.second;
+        }
+        sinfo->conn_map.clear();
+
+        close(sinfo->server_fd);
+        close(sinfo->epoll_fd);
+
+        sinfo->running = false;
+
+        delete sinfo;
+    }
+
+    exit(EXIT_SUCCESS);
+}
+
+void register_signals() {
+    dprint("configuring system signals\n");
+    if (signal(SIGINT, sig_handler) == SIG_ERR)
+        dprint("Not able to register SIGNALS (SIGINT)\n");
+    if (signal(SIGABRT, sig_handler) == SIG_ERR)
+        dprint("Not able to register SIGNALS (SIGABRT)\n");
+    if (signal(SIGSEGV, sig_handler) == SIG_ERR)
+        dprint("Not able to register SIGNALS (SIGSEGV)\n");
 }
 
 int handle_socket_error() {
@@ -584,7 +625,7 @@ void *connection_handle(void *info) {
     (*cinfo->map)[cinfo->client_addr.s4.sin_addr.s_addr] = cinfo;
 
     delete info;
-    dprint("\nThread %lx: done, new connection created.\n", (long) pthread_self());
+    // dprint("\nThread %lx: done, new connection created.\n", (long) pthread_self());
     pthread_exit((void *) NULL);
 
 cleanup:
@@ -610,7 +651,7 @@ void dtls_listener(server_info *sinfo) {
     THREAD_setup();
 
     while (sinfo->running) {
-        dprint("waiting for listen event....\n");
+        // dprint("waiting for listen event....\n");
         //clear client address buffer
         memset(&client_addr, 0, sizeof(struct sockaddr_storage));
 
@@ -727,10 +768,8 @@ void idle_connection_time_handler(size_t timer_id, void *user_data){
 }
 
 int main(int argc, char *argv[]) {
-    server_info *sinfo;
     int pid;
     struct epoll_event event = {};
-    bool running = true;
     size_t idel_connection_timer = 0;
 
     int ev_num;
@@ -799,14 +838,16 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
+    register_signals();
+
     std::thread dtlsListenThread(dtls_listener, sinfo);
 
     Timer::initialize();
     /*idel_connection_timer = Timer::start_timer(IDLE_CONNECTION_TIMER_INTERVAL, t_unit::SEC, idle_connection_time_handler,
                                                t_timer::TIMER_PERIODIC, sinfo);*/
 
-    while (running) {
-        dprint("waiting for epoll event....\n");
+    while (sinfo->running) {
+        // dprint("waiting for epoll event....\n");
         // Wait for something to happen on one of the file descriptors
         // we are waiting on
         do {
@@ -815,11 +856,11 @@ int main(int argc, char *argv[]) {
         if (ev_num < 0) {
             if (errno == EINTR) {
                 perror("epoll_wait interrupted");
-                running = false;
+                sinfo->running = false;
                 break;
             } else {
                 perror("epoll_wait failed");
-                running = false;
+                sinfo->running = false;
                 break;
             }
         }
@@ -920,12 +961,9 @@ int main(int argc, char *argv[]) {
     }
 
     sinfo->running = false;
-    for (auto &it : sinfo->conn_map) {
-        delete it.second;
-    }
-    sinfo->conn_map.clear();
-    dtlsListenThread.join();
-    delete sinfo;
 
+    dtlsListenThread.join();
+
+    dprint("shutdown successful\n");
     return 0;
 }
