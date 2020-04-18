@@ -738,9 +738,9 @@ static void remove_client(client_info *cinfo){
                    inet_ntoa(((struct sockaddr_in *) &cinfo->client_addr)->sin_addr),
                    ntohs(((struct sockaddr_in *) &cinfo->client_addr)->sin_port), e.what());
         }
-        if(SSL_shutdown(cinfo->ssl) == 0){
+        /*if(SSL_shutdown(cinfo->ssl) == 0){
             SSL_shutdown(cinfo->ssl);
-        }
+        }*/
         close(cinfo->client_fd);
         SSL_free(cinfo->ssl);
         // remove from map
@@ -949,6 +949,13 @@ int main(int argc, char *argv[]) {
                 }
 
                 if(!client->state) {
+                    if(SSL_shutdown(client->ssl) == 0){
+                        SSL_shutdown(client->ssl);
+                    }
+                    client->state = 2;
+                }
+
+                if(client->state == 2){
                     //remove from epoll
                     remove_client(client);
                 }
