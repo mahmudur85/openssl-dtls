@@ -55,7 +55,7 @@ static pthread_mutex_t* mutex_buf = NULL;
 
 typedef struct conn_sockaddr_t {
     socklen_t length;
-    struct sockaddr_storage address;
+    struct sockaddr address;
 } conn_sockaddr;
 
 struct custom_buffer {
@@ -93,15 +93,36 @@ struct custom_buffer {
     }
 };
 
-typedef struct connection_info_t {
-    struct sockaddr_storage client_addr;
-    struct addrinfo server;
-    std::deque<void*> queue;
+struct connection_info {
+    conn_sockaddr connaddr;
+    //struct addrinfo server;
+    //std::deque<void*> queue;
     SSL *ssl;
-} client_info;
+
+    connection_info() {
+        memset(&connaddr, 0, sizeof(conn_sockaddr));
+        //memset(&server, 0, sizeof(server));
+        ssl = nullptr;
+    }
+
+    ~connection_info() {
+        if(ssl != nullptr){
+            SSL_free(ssl);
+        }
+    }
+
+    static connection_info *new_client_info(SSL *ssl, struct sockaddr *addr, socklen_t addr_len){
+        auto *cf = new connection_info();
+        cf->ssl = ssl;
+        memcpy(&cf->connaddr.address, addr, sizeof(struct sockaddr));
+        cf->connaddr.length = addr_len;
+        return cf;
+    }
+
+};
 
 typedef struct server_info_t {
-    unordered_map<in_addr_t, client_info *> conn_map;
+    unordered_map<in_addr_t, connection_info *> conn_map;
 } server_info;
 
 struct pass_info {
@@ -173,6 +194,30 @@ static void dtls_report_err(char *fmt, ...) {
     va_end(args);
 }
 
+const char *sdump_addr(struct sockaddr *sa)
+{
+    static char buf[1024];
+
+    switch (sa->sa_family)
+    {
+        case AF_INET:
+            inet_ntop(AF_INET, &((struct sockaddr_in *)sa)->sin_addr, buf, sizeof(buf));
+            sprintf(buf+strlen(buf), ":%d", ntohs(((struct sockaddr_in *)sa)->sin_port));
+            break;
+
+        case AF_INET6:
+            inet_ntop(AF_INET6, &((struct sockaddr_in6 *)sa)->sin6_addr, buf, sizeof(buf));
+            sprintf(buf+strlen(buf), ":%d", ntohs(((struct sockaddr_in6 *)sa)->sin6_port));
+            break;
+
+        default:
+            memmove(buf, "unknown", 8);
+            break;
+    }
+
+    return buf;
+}
+
 static int dtls_verify_callback (int ok, X509_STORE_CTX *ctx) {
     /* This function should ask the user
      * if he trusts the received certificate.
@@ -185,11 +230,8 @@ static int dtls_verify_callback (int ok, X509_STORE_CTX *ctx) {
 static int generate_cookie(SSL *ssl, unsigned char *cookie, unsigned int *cookie_len) {
     unsigned char *buffer, result[EVP_MAX_MD_SIZE];
     unsigned int length = 0, resultlength;
-    union {
-        struct sockaddr_storage ss;
-        struct sockaddr_in6 s6;
-        struct sockaddr_in s4;
-    } peer;
+
+    struct sockaddr peer;
 
     /* Initialize a random secret */
     if (!cookie_initialized) {
@@ -201,11 +243,13 @@ static int generate_cookie(SSL *ssl, unsigned char *cookie, unsigned int *cookie
     }
 
     /* Read peer information */
-    (void) BIO_dgram_get_peer(SSL_get_rbio(ssl), &peer);
+    memcpy(&peer, (struct sockaddr *) SSL_get_app_data(ssl), sizeof(struct sockaddr));
+
+    //derror("generating cookie for %s\n", sdump_addr(&peer));
 
     /* Create buffer with peer's address and port */
     length = 0;
-    switch (peer.ss.ss_family) {
+    switch (((struct sockaddr_storage *) &peer)->ss_family) {
         case AF_INET:
             length += sizeof(struct in_addr);
             break;
@@ -224,21 +268,21 @@ static int generate_cookie(SSL *ssl, unsigned char *cookie, unsigned int *cookie
         return 0;
     }
 
-    switch (peer.ss.ss_family) {
+    switch (((struct sockaddr_storage *) &peer)->ss_family) {
         case AF_INET:
             memcpy(buffer,
-                   &peer.s4.sin_port,
+                   &((struct sockaddr_in *) &peer)->sin_port,
                    sizeof(in_port_t));
-            memcpy(buffer + sizeof(peer.s4.sin_port),
-                   &peer.s4.sin_addr,
+            memcpy(buffer + sizeof(((struct sockaddr_in *) &peer)->sin_port),
+                   &((struct sockaddr_in *) &peer)->sin_addr,
                    sizeof(struct in_addr));
             break;
         case AF_INET6:
             memcpy(buffer,
-                   &peer.s6.sin6_port,
+                   &((struct sockaddr_in6 *) &peer)->sin6_port,
                    sizeof(in_port_t));
             memcpy(buffer + sizeof(in_port_t),
-                   &peer.s6.sin6_addr,
+                   &((struct sockaddr_in6 *) &peer)->sin6_addr,
                    sizeof(struct in6_addr));
             break;
         default:
@@ -260,22 +304,21 @@ static int generate_cookie(SSL *ssl, unsigned char *cookie, unsigned int *cookie
 static int verify_cookie(SSL *ssl, const unsigned char *cookie, unsigned int cookie_len) {
     unsigned char *buffer, result[EVP_MAX_MD_SIZE];
     unsigned int length = 0, resultlength;
-    union {
-        struct sockaddr_storage ss;
-        struct sockaddr_in6 s6;
-        struct sockaddr_in s4;
-    } peer;
+
+    struct sockaddr peer{};
 
     /* If secret isn't initialized yet, the cookie can't be valid */
     if (!cookie_initialized)
         return 0;
 
     /* Read peer information */
-    (void) BIO_dgram_get_peer(SSL_get_rbio(ssl), &peer);
+    memcpy(&peer, (struct sockaddr *) SSL_get_app_data(ssl), sizeof(struct sockaddr));
+
+    //derror("verifying cookie for %s\n", sdump_addr(&peer));
 
     /* Create buffer with peer's address and port */
     length = 0;
-    switch (peer.ss.ss_family) {
+    switch (((struct sockaddr_storage *) &peer)->ss_family) {
         case AF_INET:
             length += sizeof(struct in_addr);
             break;
@@ -294,21 +337,21 @@ static int verify_cookie(SSL *ssl, const unsigned char *cookie, unsigned int coo
         return 0;
     }
 
-    switch (peer.ss.ss_family) {
+    switch (((struct sockaddr_storage *) &peer)->ss_family) {
         case AF_INET:
             memcpy(buffer,
-                   &peer.s4.sin_port,
+                   &((struct sockaddr_in *) &peer)->sin_port,
                    sizeof(in_port_t));
-            memcpy(buffer + sizeof(in_port_t),
-                   &peer.s4.sin_addr,
+            memcpy(buffer + sizeof(((struct sockaddr_in *) &peer)->sin_port),
+                   &((struct sockaddr_in *) &peer)->sin_addr,
                    sizeof(struct in_addr));
             break;
         case AF_INET6:
             memcpy(buffer,
-                   &peer.s6.sin6_port,
+                   &((struct sockaddr_in6 *) &peer)->sin6_port,
                    sizeof(in_port_t));
             memcpy(buffer + sizeof(in_port_t),
-                   &peer.s6.sin6_addr,
+                   &((struct sockaddr_in6 *) &peer)->sin6_addr,
                    sizeof(struct in6_addr));
             break;
         default:
@@ -363,7 +406,6 @@ void signal_handler(int sig) {
     fflush(stderr);
 }
 
-
 bool make_socket_non_blocking(int fd) {
     int flags, s;
 
@@ -383,6 +425,11 @@ bool make_socket_non_blocking(int fd) {
     return true;
 }
 
+socklen_t get_address_len(const sockaddr* address) {
+    if(address->sa_family == AF_INET) return sizeof(struct sockaddr_in);
+    else if(address->sa_family == AF_INET6) return sizeof(struct sockaddr_in6);
+    return 0;
+}
 
 int get_server_socket_and_bind(std::string &bind_addr, std::string &port, struct addrinfo *server) {
     int sock = -1;
@@ -545,14 +592,13 @@ SSL *new_ssl(SSL_CTX *ctx) {
     return ssl;
 }
 
-int dtls_send(SSL *ssl, conn_sockaddr *client_addr, int fd, char* data, int data_len){
+int dtls_send(SSL *ssl, struct sockaddr *addr, socklen_t addr_len, int fd, char* data, int data_len){
 
     int writelen = SSL_write(ssl, data, data_len);
     if(writelen > 0) {
         char enc_buf[BUFSIZE];
         auto size = (size_t) BIO_read(SSL_get_wbio(ssl), enc_buf, sizeof(enc_buf));
-        sendto(fd, enc_buf, size, 0, (struct sockaddr *) &client_addr->address,
-                               (socklen_t) client_addr->length);
+        sendto(fd, enc_buf, size, 0, addr, addr_len);
         return writelen;
     }
     return -1;
@@ -564,6 +610,9 @@ int main(int argc, char *argv[]) {
     struct epoll_event event = {};
     bool running = true;
 
+    struct connection_info *conn;
+    unordered_map<in_addr_t, struct connection_info *> conn_map;
+
     pthread_t tid;
 
     int ev_num;
@@ -573,9 +622,9 @@ int main(int argc, char *argv[]) {
     std::string bind_addr("192.168.2.2");
     std::string bind_port("9000");
 
-    conn_sockaddr client_addr;
-    struct pass_info *info;
-    SSL *ssl;
+    struct sockaddr peer;
+    socklen_t peerLen = 0;
+    SSL *conn_ssl;
     SSL_CTX *ctx;
 
     //struct custom_buffer *cbuf;
@@ -640,15 +689,15 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    ssl = new_ssl(ctx);
+    conn_ssl = new_ssl(ctx);
     //cbuf = custom_buffer::new_custom_buffer(BUFSIZE);
-
+    dprint("dtls test server is listening on %s:%s\n", bind_addr.c_str(), bind_port.c_str());
     while (running){
-        dprint("waiting for en event....\n");
+        //dprint("waiting for en event....\n");
         // Wait for something to happen on one of the file descriptors
         // we are waiting on
         do {
-            ev_num = epoll_wait(epoll_fd, events, MAX_TUNNEL_EVENTS, EPOLL_TIMEOUT);
+            ev_num = epoll_wait(epoll_fd, events, MAX_TUNNEL_EVENTS, -1); //
         } while (ev_num == -1 && errno == EINTR);
         if (ev_num < 0) {
             if (errno == EINTR) {
@@ -684,34 +733,72 @@ int main(int argc, char *argv[]) {
                 char o_buffer[BUFSIZE];
                 char i_buffer[BUFSIZE];
                 int written = 0, read = 0, pending = 0;
+                SSL *ssl = nullptr;
 
-                memset(&client_addr, 0, sizeof(conn_sockaddr));
+                peer.sa_family = AF_INET;
+                peerLen = get_address_len(&peer);
 
-                read = static_cast<int>(recvfrom(events[i].data.fd, i_buffer, sizeof(i_buffer), MSG_DONTWAIT,
-                                                      (sockaddr *) &client_addr.address, &client_addr.length));
-
-                if(read > 0) {
-                    written = BIO_write(SSL_get_rbio(ssl), i_buffer, sizeof(i_buffer));
-                }
-
-                if (written > 0) {
-                    if (!SSL_is_init_finished(ssl)) {
-                        SSL_do_handshake(ssl);
-                    } else {
-                        int r = SSL_read(ssl,o_buffer, sizeof(o_buffer));
-                        o_buffer[r] = '\0';
-                        printf("%d bytes received: %s\n", r, o_buffer);
-                        sprintf(o_buffer, "%d received '%s'", r, o_buffer);
-                        dtls_send(ssl, &client_addr, events[i].data.fd, o_buffer, r);
+                while (true) {
+                    read = (int) recvfrom(events[i].data.fd, i_buffer, BUFSIZE, MSG_DONTWAIT, &peer, &peerLen);
+                    if (read == -1) {
+                        if ((errno == EAGAIN) ||
+                            (errno == EWOULDBLOCK)) {
+                            // We have processed all incoming connections
+                            //derror("We have processed all incoming connections...");
+                        } else {
+                            perror("recvfrom() error!");
+                        }
+                        break;
                     }
-                }
+                    if (read > 0) {
+                        auto it = conn_map.find(((struct sockaddr_in *) &peer)->sin_addr.s_addr);
+                        if (it != conn_map.end()) {
+                            struct connection_info *c = it->second;
+                            ssl = c->ssl;
+                        } else {
+                            ssl = conn_ssl;
+                            SSL_set_app_data(ssl, &peer);
+                        }
 
-                pending = static_cast<int>(BIO_ctrl_pending(SSL_get_wbio(ssl)));
+                        written = BIO_write(SSL_get_rbio(ssl), i_buffer, sizeof(i_buffer));
 
-                if (pending) {
-                    read = BIO_read(SSL_get_wbio(ssl), o_buffer, sizeof(o_buffer));
-                    sendto(events[i].data.fd, o_buffer, read, 0, (struct sockaddr *) &client_addr.address,
-                           (socklen_t) client_addr.length);
+                        if (written > 0) {
+                            if (!SSL_is_init_finished(ssl)) {
+                                SSL_do_handshake(ssl);
+                                conn = connection_info::new_client_info(ssl, &peer, peerLen);
+                                conn_map[((struct sockaddr_in *) &peer)->sin_addr.s_addr] = conn;
+                                conn_ssl = new_ssl(ctx);
+                            } else {
+                                int r = SSL_read(ssl, o_buffer, sizeof(o_buffer));
+                                if( r > 0) {
+                                    o_buffer[r] = '\0';
+                                    printf("%d bytes received: %s\n", r, o_buffer);
+                                    //sprintf(o_buffer, "%d received '%s'", r, o_buffer);
+                                    dtls_send(ssl, &peer, peerLen, events[i].data.fd, o_buffer, r);
+                                    if(SSL_shutdown(ssl) == 0){
+                                        SSL_shutdown(ssl);
+                                    }
+                                }
+
+                                if (r == 0){
+                                    derror("closing connection for  %s\n", sdump_addr(&peer));
+                                    SSL_free(ssl);
+                                    auto it = conn_map.find(((struct sockaddr_in *) &peer)->sin_addr.s_addr);
+                                    if (it != conn_map.end()) {
+                                        //struct connection_info *c = it->second;
+                                        conn_map.erase(((struct sockaddr_in *) &peer)->sin_addr.s_addr);
+                                    }
+                                }
+                            }
+                        }
+
+                        pending = static_cast<int>(BIO_ctrl_pending(SSL_get_wbio(ssl)));
+
+                        if (pending) {
+                            read = BIO_read(SSL_get_wbio(ssl), o_buffer, sizeof(o_buffer));
+                            sendto(events[i].data.fd, o_buffer, (size_t) read, 0, &peer, (socklen_t) peerLen);
+                        }
+                    }
                 }
 
                 /*while (DTLSv1_listen(ssl, (BIO_ADDR *) &client_addr) <= 0);
