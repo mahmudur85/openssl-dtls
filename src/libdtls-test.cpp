@@ -590,6 +590,14 @@ void *connection_handle(void *info) {
         goto cleanup;
     }
 
+    if (!make_socket_non_blocking(fd)) {
+        close(fd);
+        if(SSL_shutdown(ssl) == 0){
+            SSL_shutdown(ssl);
+        }
+        goto cleanup;
+    }
+
     /* Set and activate timeouts */
     timeout.tv_sec = 5;
     timeout.tv_usec = 0;
